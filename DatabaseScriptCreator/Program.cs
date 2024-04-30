@@ -1,4 +1,5 @@
 ﻿using Npgsql;
+using System.Data;
 
 namespace DatabaseScriptCreator
 {
@@ -96,47 +97,138 @@ namespace DatabaseScriptCreator
                     string schemaName = nameParts.Length > 1 ? nameParts[0] : "public"; // Default schema to 'public' if not specified
                     string actualTableName = nameParts[nameParts.Length - 1]; // Extract table name
 
-                    // Retrieve columns for the table from information_schema
-                    List<string> columns = new List<string>();
-                    string query = $@"SELECT column_name || ' ' || data_type ||
-                     CASE
-                        WHEN character_maximum_length IS NOT NULL THEN '(' || character_maximum_length || ')'
-                        ELSE ''
-                     END AS column_definition
-                     FROM information_schema.columns
-                     WHERE table_schema = '{schemaName}' AND table_name = '{actualTableName}'
-                     ORDER BY ordinal_position";
+                    string indexDefinition = GetIndexDev(actualTableName, connectionString);
+
+
+                    // Retrieve columns and constraints for the table from information_schema
+                    List<string> columnDefinitions = new List<string>();
+                    List<string> constraints = new List<string>();
+                    List<string> pkConstraints = new List<string>();
 
                     using (var connection = new NpgsqlConnection(connectionString))
                     {
                         connection.Open();
+
+                        string query = $@"
+                                       SELECT 
+                                           columns.column_name,
+                                           data_type,
+                                           is_nullable,
+                                           identity_generation,
+                                           fk_constraint_name,
+                                       	   foreign_table_schema,
+                                       	   foreign_table_name,
+                                       	   foreign_column_name
+                                          FROM 
+                                           information_schema.columns
+                                           LEFT JOIN (
+                                               SELECT
+                                                   tc.constraint_name AS fk_constraint_name,
+                                       		    tc.table_name,
+                                       		    ccu.table_schema AS foreign_table_schema,
+                                       		    ccu.table_name AS foreign_table_name,
+                                                   ccu.column_name AS foreign_column_name 
+                                       		    
+                                               FROM 
+                                                   information_schema.table_constraints tc
+                                       		JOIN information_schema.constraint_column_usage AS ccu
+                                           ON ccu.constraint_name = tc.constraint_name
+                                               WHERE 
+                                                   constraint_type = 'FOREIGN KEY'
+                                           ) AS constraints_fk
+                                               ON information_schema.columns.table_name = constraints_fk.table_name
+                                               AND information_schema.columns.column_name = (
+                                                   SELECT
+                                                       kcu.column_name
+                                                   FROM 
+                                                       information_schema.key_column_usage AS kcu
+                                                   WHERE 
+                                                       kcu.table_name = information_schema.columns.table_name
+                                                       AND kcu.constraint_name = constraints_fk.fk_constraint_name
+                                               )
+                                       WHERE 
+                                           information_schema.columns.table_schema = '{schema}' 
+                                           AND information_schema.columns.table_name = '{actualTableName}'
+                                       ORDER BY information_schema.columns.ordinal_position";
 
                         using (var cmd = new NpgsqlCommand(query, connection))
                         using (var reader = cmd.ExecuteReader())
                         {
                             while (reader.Read())
                             {
-                                columns.Add(reader.GetString(0));
+                                string columnName = reader.GetString(0);
+                                string dataType = reader.GetString(1);
+                                string isNullable = reader.GetString(2) == "YES" ? "" : "NOT NULL";
+                                var identityGeneration = reader.IsDBNull(3) ? "" : reader.GetString(3);
+
+                                if (identityGeneration == "ALWAYS")
+                                {
+                                    identityGeneration = "GENERATED ALWAYS AS IDENTITY";
+                                }
+                                else if (identityGeneration == "BY DEFAULT")
+                                {
+                                    identityGeneration = "GENERATED BY DEFAULT AS IDENTITY";
+                                }
+
+                                // Construct column definition
+                                string columnDefinition = $"{columnName} {dataType} {isNullable} {identityGeneration}";
+
+                                // Append constraints
+                                columnDefinition += string.Join("\n\t", constraints);
+
+                                columnDefinitions.Add(columnDefinition);
+                                
+                                if (!reader.IsDBNull(4))
+                                {
+                                    // If it is part of the primary key, add it to a separate list
+                                    pkConstraints.Add($"CONSTRAINT {reader.GetString(4)} FOREIGN KEY ({columnName})\n" +
+                                               $"         REFERENCES {reader.GetString(5)}.{reader.GetString(5)} ({reader.GetString(6)}) MATCH SIMPLE");
+                                }
+
+
                             }
                         }
+
+                        var primary = GetPrimary(actualTableName, connectionString);
+
+                        if(primary is not null)
+                        {
+                            pkConstraints.Add($"CONSTRAINT {primary.ConstraintName} PRIMARY KEY ({primary.ConcatenatedColumnNames})");
+                        }
+
+                        var unique = GetUnique(actualTableName, connectionString);
+
+                        if (unique is not null)
+                        {
+                            pkConstraints.Add($"CONSTRAINT {unique.ConstraintName} UNIQUE ({unique.ConcatenatedColumnNames})");
+                        }
+
+                        // Add the primary key constraint to the end of the column definitions
+                        columnDefinitions.AddRange(pkConstraints);
+
+                        // Construct the CREATE TABLE statement
+                        string createTableStatement = $"CREATE TABLE IF NOT EXISTS {schemaName}.{actualTableName} (\n\t{string.Join(",\n\t", columnDefinitions)}\n);";
+
+                        // Create schema directory if it doesn't exist
+                        string schemaDirectory = Path.Combine(tablesDirectory, schemaName);
+                        if (!Directory.Exists(schemaDirectory))
+                        {
+                            Directory.CreateDirectory(schemaDirectory);
+                        }
+
+                        // Create table script file within schema directory
+                        string filePath = Path.Combine(schemaDirectory, $"{actualTableName}.sql");
+                        File.WriteAllText(filePath, createTableStatement);
+
+                        if (!string.IsNullOrEmpty(indexDefinition))
+                        {
+                            File.AppendAllText(filePath, indexDefinition);
+                        }
+
                     }
-
-
-                    // Construct the CREATE TABLE statement
-                    string createTableStatement = $"CREATE TABLE IF NOT EXISTS {table} (\n\t{string.Join(",\n\t", columns)}\n);";
-
-                    // Create schema directory if it doesn't exist
-                    string schemaDirectory = Path.Combine(tablesDirectory, schemaName);
-                    if (!Directory.Exists(schemaDirectory))
-                    {
-                        Directory.CreateDirectory(schemaDirectory);
-                    }
-
-                    // Create table script file within schema directory
-                    string filePath = Path.Combine(schemaDirectory, $"{actualTableName}.sql");
-                    File.WriteAllText(filePath, createTableStatement);
                 }
             }
+
 
             // Create SQL scripts for functions
             foreach (string schema in schemas)
@@ -241,6 +333,91 @@ namespace DatabaseScriptCreator
                     }
                 }
             }
+
+            static string GetIndexDev(string tableName, string connectionString)
+            {
+                using (var connection = new NpgsqlConnection(connectionString))
+                {
+                    connection.Open();
+
+                    var query = $"SELECT indexdef FROM pg_indexes WHERE tablename = '{tableName}' AND indexname ILIKE '%index'";
+
+                    using (var cmd = new NpgsqlCommand(query, connection))
+                    {
+                        var result = cmd.ExecuteScalar();
+                        return result != null ? result.ToString().Replace("CREATE", "CREATE INDEX IF NOT EXISTS") : null;
+                    }
+                }
+            }
+
+            static Unique GetUnique(string tableName, string connectionString)
+            {
+                using (var connection = new NpgsqlConnection(connectionString))
+                {
+                    connection.Open();
+
+                    var query = $@"SELECT tc.constraint_name, STRING_AGG(ccu.column_name, ',') AS concatenated_column_names 
+                      FROM information_schema.table_constraints tc 
+                      JOIN information_schema.constraint_column_usage AS ccu 
+                      ON ccu.constraint_name = tc.constraint_name 
+                      WHERE constraint_type = 'UNIQUE' AND tc.table_name = '{tableName}' 
+                      GROUP BY tc.constraint_name";
+
+                    using (var cmd = new NpgsqlCommand(query, connection))
+                    {
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            if (reader.Read())
+                            {
+                                return new Unique
+                                {
+                                    ConstraintName = reader.GetString(0),
+                                    ConcatenatedColumnNames = reader.GetString(1)
+                                };
+                            }
+                            else
+                            {
+                                return null; 
+                            }
+                        }
+                    }
+                }
+            }
+
+            static Primary GetPrimary(string tableName, string connectionString)
+            {
+                using (var connection = new NpgsqlConnection(connectionString))
+                {
+                    connection.Open();
+
+                    var query = $@"SELECT tc.constraint_name, STRING_AGG(ccu.column_name, ',') AS concatenated_column_names 
+                      FROM information_schema.table_constraints tc 
+                      JOIN information_schema.constraint_column_usage AS ccu 
+                      ON ccu.constraint_name = tc.constraint_name 
+                      WHERE constraint_type = 'PRIMARY KEY' AND tc.table_name = '{tableName}' 
+                      GROUP BY tc.constraint_name";
+
+                    using (var cmd = new NpgsqlCommand(query, connection))
+                    {
+                        using (var reader = cmd.ExecuteReader())
+                        {
+                            if (reader.Read())
+                            {
+                                return new Primary
+                                {
+                                    ConstraintName = reader.GetString(0),
+                                    ConcatenatedColumnNames = reader.GetString(1)
+                                };
+                            }
+                            else
+                            {
+                                return null;
+                            }
+                        }
+                    }
+                }
+            }
+
         }
     }
 
@@ -250,5 +427,19 @@ namespace DatabaseScriptCreator
         public int ParamsCount { get; set; }
 
         public string? Text { get; set; }
+    }
+
+    public class Unique
+    {
+        public string ConstraintName { get; set; }
+
+        public string ConcatenatedColumnNames { get; set; }
+    }
+
+    public class Primary
+    {
+        public string ConstraintName { get; set; }
+
+        public string ConcatenatedColumnNames { get; set; }
     }
 }
